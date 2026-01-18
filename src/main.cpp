@@ -50,12 +50,15 @@
 #define INVERT_DIRECTION false  // Set to true if height decreases when angle increases
 
 // AS5600 Register Addresses
+#define AS5600_REG_ZMCO 0x00         // ZMCO register (read-only, can test communication)
+#define AS5600_REG_STATUS 0x0B       // Status register (check magnet presence)
 #define AS5600_REG_RAW_ANGLE_H 0x0C  // High byte of raw angle (12-bit)
 #define AS5600_REG_RAW_ANGLE_L 0x0D  // Low byte of raw angle
 
 // Display Update
 #define DISPLAY_UPDATE_RATE_MS 50  // ~20 Hz
 #define DISPLAY_THRESHOLD 0.01f    // Only update display if change > threshold
+#define DISPLAY_FORCE_UPDATE_MS 500  // Force update every 500ms even if no change
 
 // Button Debouncing
 #define DEBOUNCE_MS 50
@@ -82,6 +85,7 @@ bool lastButtonUnitState = HIGH;
 
 // Display update
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastForceDisplayUpdate = 0;
 float lastDisplayedHeight = -999.0f;
 
 // ============================================================================
@@ -93,23 +97,63 @@ float lastDisplayedHeight = -999.0f;
  * Returns -1 on error
  */
 int16_t readAngleRaw() {
+  // Add delay before I2C operations to ensure sensor is ready
+  delayMicroseconds(1000);  // Increased delay for stability
+  
+  // Try reading RAW_ANGLE register (0x0C) - standard I2C read sequence
   Wire.beginTransmission(AS5600_ADDRESS);
-  Wire.write(AS5600_REG_RAW_ANGLE_H);
-  if (Wire.endTransmission() != 0) {
+  Wire.write(AS5600_REG_RAW_ANGLE_H);  // Set register pointer to 0x0C
+  uint8_t error = Wire.endTransmission();  // Send stop bit
+  
+  if (error != 0) {
+    static unsigned long lastErrorPrint = 0;
+    unsigned long now = millis();
+    if (now - lastErrorPrint > 2000) {
+      Serial.print("[DEBUG] readAngleRaw() - Register 0x0C write error: ");
+      Serial.print(error);
+      Serial.print(" at address 0x");
+      Serial.println(AS5600_ADDRESS, HEX);
+      Serial.println("[DEBUG] AS5600 detected but register write failing. Check magnet distance/position.");
+      lastErrorPrint = now;
+    }
     return -1;  // I2C error
   }
   
-  if (Wire.requestFrom(AS5600_ADDRESS, 2) != 2) {
+  // Small delay before read
+  delayMicroseconds(100);
+  
+  // Request 2 bytes from sensor
+  uint8_t bytesReceived = Wire.requestFrom((uint8_t)AS5600_ADDRESS, (uint8_t)2);
+  if (bytesReceived != 2) {
+    static unsigned long lastErrorPrint = 0;
+    unsigned long now = millis();
+    if (now - lastErrorPrint > 2000) {
+      Serial.print("[DEBUG] readAngleRaw() - Failed to receive 2 bytes. Received: ");
+      Serial.print(bytesReceived);
+      Serial.println(" bytes");
+      lastErrorPrint = now;
+    }
     return -1;  // Failed to read 2 bytes
   }
   
   uint8_t highByte = Wire.read();
   uint8_t lowByte = Wire.read();
   
-  // AS5600 returns 12-bit value in high byte (bits 11-4) and low byte (bits 3-0)
-  // High byte contains upper 8 bits, low byte contains lower 4 bits
+  // AS5600 RAW_ANGLE register (0x0C/0x0D) contains 12-bit value
+  // High byte: bits 11-4 (in lower 8 bits of high byte)
+  // Low byte: bits 3-0 (in lower 4 bits of low byte), bits 7-4 are 0
+  // Combined: bits [11:0] contain the 12-bit angle value
   uint16_t rawAngle = ((uint16_t)highByte << 8) | lowByte;
   rawAngle = rawAngle & 0x0FFF;  // Mask to 12 bits (0-4095)
+  
+  // Log successful reads occasionally
+  static unsigned long lastSuccessPrint = 0;
+  unsigned long now = millis();
+  if (now - lastSuccessPrint > 5000) {  // Print success every 5 seconds
+    Serial.print("[DEBUG] readAngleRaw() - SUCCESS! Read angle: ");
+    Serial.println(rawAngle);
+    lastSuccessPrint = now;
+  }
   
   return (int16_t)rawAngle;
 }
@@ -146,9 +190,17 @@ float calculateHeightMM(int16_t currentCounts) {
 // ============================================================================
 
 void initDisplay() {
+  Serial.println("\n[DEBUG] Starting OLED initialization...");
+  Serial.print("[DEBUG] Attempting to initialize OLED at address 0x");
+  Serial.println(OLED_ADDRESS, HEX);
+  
   oledPresent = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
   
+  Serial.print("[DEBUG] display.begin() returned: ");
+  Serial.println(oledPresent ? "TRUE (success)" : "FALSE (failed)");
+  
   if (oledPresent) {
+    Serial.println("[DEBUG] OLED initialized, clearing and drawing init screen...");
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
@@ -156,19 +208,22 @@ void initDisplay() {
     display.println("Ride Height");
     display.println("Initializing...");
     display.display();
+    Serial.println("[DEBUG] Init screen displayed, waiting 500ms...");
     delay(500);
+    Serial.println("[DEBUG] OLED initialization complete.");
   } else {
-    Serial.println("OLED not found! Continuing with Serial output only.");
+    Serial.println("[DEBUG] ERROR: OLED not found! Continuing with Serial output only.");
   }
 }
 
-void updateDisplay(float heightMM) {
+void updateDisplay(float heightMM, bool forceUpdate = false) {
   if (!oledPresent) {
     return;
   }
   
-  // Only update if change is significant (reduce flicker)
-  if (abs(heightMM - lastDisplayedHeight) < DISPLAY_THRESHOLD && 
+  // Only update if change is significant (reduce flicker) or if forced
+  float heightDiff = abs(heightMM - lastDisplayedHeight);
+  if (!forceUpdate && heightDiff < DISPLAY_THRESHOLD && 
       lastDisplayedHeight != -999.0f) {
     return;
   }
@@ -191,6 +246,7 @@ void updateDisplay(float heightMM) {
   
   // Display debug info (small, bottom line)
   int16_t rawCounts = readAngleRaw();
+  
   display.setTextSize(1);
   display.setCursor(0, 24);
   if (rawCounts >= 0) {
@@ -300,7 +356,7 @@ void setup() {
   
   // Initialize I2C
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);  // 400kHz I2C speed
+  Wire.setClock(50000);  // 50kHz I2C speed (very slow for maximum reliability)
   
   // Scan I2C bus
   scanI2C();
@@ -320,9 +376,27 @@ void setup() {
     zeroOffsetCounts = initialCounts;
     Serial.print("Initial zero set to: ");
     Serial.println(zeroOffsetCounts);
+    
+    // Update display with initial reading (after a small delay to ensure display is ready)
+    if (oledPresent) {
+      Serial.println("[DEBUG] OLED is present, preparing initial display update...");
+      delay(100);  // Give display time to be ready
+      float initialHeight = calculateHeightMM(initialCounts);
+      Serial.print("[DEBUG] Calculated initial height: ");
+      Serial.println(initialHeight, 3);
+      lastDisplayedHeight = -999.0f;  // Force display update
+      Serial.println("[DEBUG] Calling updateDisplay() with initial height...");
+      updateDisplay(initialHeight, true);  // Force initial update
+      lastForceDisplayUpdate = millis();  // Initialize force update timer
+      Serial.println("[DEBUG] Initial display update complete.");
+    } else {
+      Serial.println("[DEBUG] OLED not present, skipping initial display update.");
+    }
   } else {
     Serial.println("WARNING: Could not read AS5600 on startup!");
   }
+  
+  lastDisplayUpdate = millis();  // Initialize display update timer
   
   Serial.println("Setup complete. Press ZERO button to calibrate.");
   Serial.println("Press UNIT button to toggle mm/inch.");
@@ -339,12 +413,21 @@ void loop() {
   handleButtons();
   
   // Update display at regular interval
-  if (now - lastDisplayUpdate >= DISPLAY_UPDATE_RATE_MS) {
+  unsigned long timeSinceLastUpdate = now - lastDisplayUpdate;
+  if (timeSinceLastUpdate >= DISPLAY_UPDATE_RATE_MS) {
     int16_t currentCounts = readAngleRaw();
     
     if (currentCounts >= 0) {
       float heightMM = calculateHeightMM(currentCounts);
-      updateDisplay(heightMM);
+      
+      // Force update periodically even if value hasn't changed much
+      unsigned long timeSinceForceUpdate = now - lastForceDisplayUpdate;
+      bool forceUpdate = (timeSinceForceUpdate >= DISPLAY_FORCE_UPDATE_MS);
+      if (forceUpdate) {
+        lastForceDisplayUpdate = now;
+      }
+      
+      updateDisplay(heightMM, forceUpdate);
       
       // Also print to Serial for debugging
       Serial.print("Counts: ");
@@ -355,15 +438,26 @@ void loop() {
       Serial.print(heightMM / 25.4f, 3);
       Serial.println(" in)");
     } else {
-      // Sensor error
-      if (oledPresent) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setCursor(0, 10);
-        display.println("SENSOR ERR");
-        display.display();
+      // Sensor error - only print occasionally to avoid spam
+      static unsigned long lastErrorPrint = 0;
+      if (now - lastErrorPrint > 1000) {  // Print error max once per second
+        Serial.println("[DEBUG] ERROR: Failed to read AS5600 in main loop!");
+        lastErrorPrint = now;
       }
-      Serial.println("ERROR: Failed to read AS5600!");
+      
+      if (oledPresent) {
+        static unsigned long lastErrorDisplay = 0;
+        // Only update error display occasionally to reduce flicker
+        if (now - lastErrorDisplay > 500) {
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setCursor(0, 10);
+          display.println("SENSOR ERR");
+          display.print("Magnet needed");
+          display.display();
+          lastErrorDisplay = now;
+        }
+      }
     }
     
     lastDisplayUpdate = now;
